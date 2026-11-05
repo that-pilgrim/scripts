@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# Function to display file contents with location
+display_file() {
+    local file="$1"
+    echo -e "\n\033[1;34m===== FILE: $(realpath "$file") =====\033[0m"
+    echo -e "\033[1;33mContents:\033[0m"
+    cat "$file"
+    echo -e "\033[1;34m===== END OF FILE =====\033[0m\n"
+}
+
+# Function to display omitted file notice
+display_omitted_file() {
+    local file="$1"
+    echo -e "\n\033[1;34m===== FILE: $(realpath "$file") =====\033[0m"
+    echo -e "\033[1;31m------------ $(basename "$file") omitted ------------\033[0m"
+    echo -e "\033[1;34m===== END OF FILE =====\033[0m\n"
+}
+
+# Parse arguments
+dir="."
+ignore_patterns=()
+ignore_cat_files=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ignore)
+            shift
+            while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+                ignore_patterns+=("$1")
+                shift
+            done
+            ;;
+        --ignore-cat)
+            shift
+            while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+                ignore_cat_files+=("$1")
+                shift
+            done
+            ;;
+        --help|-h)
+            echo "Usage: $0 [directory] [--ignore pattern1 pattern2 ...] [--ignore-cat file1 file2 ...]"
+            echo "  Displays directory structure and file contents"
+            echo "  --ignore: Exclude files/directories from tree and contents (supports patterns)"
+            echo "  --ignore-cat: Show files in tree but omit their contents"
+            exit 0
+            ;;
+        *)
+            if [[ -d "$1" ]]; then
+                dir="$1"
+            else
+                echo "Invalid argument or directory: $1"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Build the find command with exclusions
+find_cmd="find \"$dir\" -type f"
+
+# Add ignore patterns to find command
+for pattern in "${ignore_patterns[@]}"; do
+    # Handle directory patterns (ending with /)
+    if [[ "$pattern" == */ ]]; then
+        pattern="${pattern%/}"
+        find_cmd+=" -not -path \"*/$pattern/*\""
+    else
+        # For files or specific paths
+        find_cmd+=" -not -path \"*/$pattern\""
+        find_cmd+=" -not -name \"$pattern\""
+    fi
+done
+
+# First show the directory structure
+echo -e "\033[1;32m===== DIRECTORY STRUCTURE =====\033[0m"
+tree_cmd="tree \"$dir\""
+for pattern in "${ignore_patterns[@]}"; do
+    # Add exclude patterns to tree command
+    tree_cmd+=" -I \"$pattern\""
+done
+eval "$tree_cmd"
+echo -e "\033[1;32m===== END OF DIRECTORY STRUCTURE =====\033[0m\n"
+
+# Function to check if a file should have its contents omitted
+should_ignore_cat() {
+    local file="$1"
+    local filename=$(basename "$file")
+    local filepath="$file"
+    
+    for ignore_file in "${ignore_cat_files[@]}"; do
+        # Check if it matches the filename or the full path
+        if [[ "$filename" == "$ignore_file" ]] || [[ "$filepath" == *"$ignore_file"* ]] || [[ "$file" == *"$ignore_file" ]]; then
+            return 0  # true - should ignore
+        fi
+    done
+    return 1  # false - should not ignore
+}
+
+# Now process each file
+echo -e "\033[1;32m===== BEGINNING FILE CONTENTS =====\033[0m"
+eval "$find_cmd" | sort | while read -r file; do
+    # Check if this file should have its contents omitted
+    if should_ignore_cat "$file"; then
+        display_omitted_file "$file"
+    # Skip binary files
+    elif file "$file" | grep -q "text"; then
+        display_file "$file"
+    else
+        echo -e "\n\033[1;34m===== FILE: $(realpath "$file") =====\033[0m"
+        echo -e "\033[1;33m[Binary file - contents not displayed]\033[0m"
+        echo -e "\033[1;34m===== END OF FILE =====\033[0m\n"
+    fi
+done
