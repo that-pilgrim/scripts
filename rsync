@@ -1,0 +1,478 @@
+#!/bin/bash
+
+# Improved script to set up SSH keys and rsync connection between two servers using IP addresses
+# Usage: ./setup_rsync.sh [server1_ip] [server2_ip]
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Configuration file
+CONFIG_FILE="$(dirname "$0")/.rsync_setup_config"
+
+# Function to display messages
+function echo_msg() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+function echo_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+function echo_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Function to save configuration
+function save_config() {
+    cat > "$CONFIG_FILE" << EOF
+SERVER1_IP=$SERVER1_IP
+SERVER2_IP=$SERVER2_IP
+LOCAL_IP=$LOCAL_IP
+REMOTE_IP=$REMOTE_IP
+SERVER_NUM=$SERVER_NUM
+REMOTE_USER=$REMOTE_USER
+REMOTE_SERVER=$REMOTE_SERVER
+KEY_FILE=$KEY_FILE
+LAST_RUN=$(date +%Y-%m-%d_%H:%M:%S)
+EOF
+    chmod 600 "$CONFIG_FILE"
+    echo_msg "Configuration saved to $CONFIG_FILE"
+}
+
+# Function to load configuration
+function load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        echo_msg "Loaded previous configuration from $CONFIG_FILE"
+        echo_msg "Previous setup: Server $SERVER_NUM ($LOCAL_IP) to Server $((3-SERVER_NUM)) ($REMOTE_IP)"
+        echo_msg "Last run: $LAST_RUN"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to generate rsync command
+function generate_rsync_command() {
+    local source_path=$1
+    local dest_path=$2
+    local command="rsync -avz --delete -e 'ssh -i $KEY_FILE' $source_path $REMOTE_SERVER:$dest_path"
+    echo "$command"
+}
+
+# Function to configure firewall
+function configure_firewall() {
+    local remote_ip=$1
+
+    if command -v ufw >/dev/null 2>&1; then
+        echo_msg "Configuring UFW firewall..."
+        # Check if UFW is active
+        if ! sudo ufw status | grep -q "Status: active"; then
+            echo_warn "UFW is not active. Enabling..."
+            sudo ufw --force enable
+        fi
+
+        # Allow SSH port
+        sudo ufw allow 22/tcp comment "SSH port"
+
+        # Allow specific IP
+        sudo ufw allow from "$remote_ip" to any port 22 comment "Allow SSH from rsync partner"
+
+        echo_msg "UFW configured to allow SSH from $remote_ip"
+    elif command -v iptables >/dev/null 2>&1; then
+        echo_msg "Configuring iptables firewall..."
+        sudo iptables -A INPUT -p tcp --dport 22 -s "$remote_ip" -j ACCEPT
+        echo_msg "iptables configured to allow SSH from $remote_ip"
+        echo_warn "Note: This rule will not persist after reboot unless saved"
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        echo_msg "Configuring firewalld..."
+        sudo firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source address=\"$remote_ip\" port protocol=\"tcp\" port=\"22\" accept"
+        sudo firewall-cmd --reload
+        echo_msg "firewalld configured to allow SSH from $remote_ip"
+    elif command -v apf >/dev/null 2>&1; then
+        echo_msg "Configuring APF firewall..."
+        # Add IP to allow_hosts.rules
+        echo "$remote_ip # Rsync partner" | sudo tee -a /etc/apf/allow_hosts.rules > /dev/null
+        sudo apf -r
+        echo_msg "APF configured to allow SSH from $remote_ip"
+    elif command -v csf >/dev/null 2>&1; then
+        echo_msg "Configuring CSF firewall..."
+        # Add IP to csf.allow
+        echo "$remote_ip # Rsync partner" | sudo tee -a /etc/csf/csf.allow > /dev/null
+        sudo csf -r
+        echo_msg "CSF configured to allow SSH from $remote_ip"
+    else
+        echo_warn "No supported firewall (UFW, iptables, firewalld, APF, CSF) detected."
+    fi
+}
+
+# Function to check if key needs update
+function check_key_update() {
+    local key_file=$1
+    local auth_keys_file=$2
+    local remote_server=$3
+
+    if [ -f "$key_file" ]; then
+        echo_msg "SSH key already exists at $key_file"
+        echo_msg "Checking if key needs updating..."
+
+        # Get fingerprint of existing key
+        local key_fingerprint=$(ssh-keygen -l -f "$key_file" | awk '{print $2}')
+
+        # Ask user if they want to regenerate the key
+        read -p "Do you want to regenerate the SSH key? (y/n): " regen_key
+        if [[ "$regen_key" == "y" || "$regen_key" == "Y" ]]; then
+            echo_msg "Backing up old key to ${key_file}.bak"
+            cp "$key_file" "${key_file}.bak"
+            cp "${key_file}.pub" "${key_file}.pub.bak"
+
+            echo_msg "Generating new SSH key pair..."
+            ssh-keygen -t rsa -b 4096 -f "$key_file" -N "" -C "rsync-setup-$(date +%Y%m%d)"
+            chmod 600 "$key_file"
+
+            echo_warn "Key has been updated. You will need to update the authorized_keys on the remote server."
+            return 1 # Key was updated
+        else
+            echo_msg "Using existing key."
+            return 0 # Key was not updated
+        fi
+    else
+        echo_msg "No existing SSH key found. Generating new key pair..."
+        ssh-keygen -t rsa -b 4096 -f "$key_file" -N "" -C "rsync-setup-$(date +%Y%m%d)"
+        chmod 600 "$key_file"
+        return 1 # New key was created
+    fi
+}
+
+# Function to test SSH connection
+function test_ssh_connection() {
+    local remote_server=$1
+    local key_file=$2
+
+    echo_msg "Testing SSH connection to $remote_server..."
+    echo_msg "Command: ssh -i $key_file -o StrictHostKeyChecking=no $remote_server echo Connection successful"
+
+    if ssh -i "$key_file" -o "StrictHostKeyChecking=no" -o "ConnectTimeout=10" "$remote_server" "echo Connection successful"; then
+        echo_msg "SSH connection to $remote_server was successful!"
+        return 0
+    else
+        echo_error "SSH connection to $remote_server failed."
+        echo_error "Possible issues:"
+        echo "  - Firewall blocking connection"
+        echo "  - SSH service not running"
+        echo "  - IP address incorrect"
+        echo "  - Key permissions (should be 600)"
+        echo "  - authorized_keys file permissions (should be 600)"
+        echo "  - .ssh directory permissions (should be 700)"
+
+        read -p "Press r to retry, t to troubleshoot, or q to quit: " choice
+        if [ "$choice" = "r" ]; then
+            test_ssh_connection "$remote_server" "$key_file"
+        elif [ "$choice" = "t" ]; then
+            # Troubleshooting
+            echo_msg "Checking key file permissions..."
+            chmod 600 "$key_file"
+            echo_msg "Checking if remote server is reachable..."
+            ping -c 1 "$remote_server"
+            echo_msg "Testing with verbose output..."
+            ssh -v -i "$key_file" -o "StrictHostKeyChecking=no" "$remote_server" "echo Test"
+            test_ssh_connection "$remote_server" "$key_file"
+        elif [ "$choice" = "q" ]; then
+            return 1
+        else
+            test_ssh_connection "$remote_server" "$key_file"
+        fi
+    fi
+}
+
+# Check if we're in rsync command generation mode
+if [ "$1" = "--generate-command" ]; then
+    if load_config; then
+        echo_msg "Generating rsync command using previous configuration"
+        read -p "Enter source path (local): " source_path
+        read -p "Enter destination path (remote): " dest_path
+        
+        command=$(generate_rsync_command "$source_path" "$dest_path")
+        
+        echo_msg "Generated rsync command:"
+        echo -e "${GREEN}$command${NC}"
+        
+        read -p "Would you like to execute this command now? (y/n): " execute
+        if [[ "$execute" == "y" || "$execute" == "Y" ]]; then
+            echo_msg "Executing rsync command..."
+            eval "$command"
+        fi
+        
+        exit 0
+    else
+        echo_error "No previous configuration found. Please run the script without arguments first."
+        exit 1
+    fi
+fi
+
+# Check if we want to use previous configuration
+if [ -f "$CONFIG_FILE" ] && [ "$1" != "--force-new" ]; then
+    load_config
+    read -p "Would you like to use the previous configuration? (y/n): " use_prev
+    if [[ "$use_prev" == "y" || "$use_prev" == "Y" ]]; then
+        echo_msg "Using previous configuration"
+    else
+        echo_msg "Starting new configuration"
+        # Clear previous config
+        SERVER1_IP=""
+        SERVER2_IP=""
+    fi
+fi
+
+# Get server IPs from arguments or previous config or prompt user
+if [ -z "$SERVER1_IP" ] || [ -z "$SERVER2_IP" ]; then
+    if [ $# -eq 2 ]; then
+        SERVER1_IP=$1
+        SERVER2_IP=$2
+    else
+        echo_msg "Please provide the IP addresses for both servers:"
+        read -p "Server 1 IP address: " SERVER1_IP
+        read -p "Server 2 IP address: " SERVER2_IP
+    fi
+fi
+
+# Validate IP addresses
+function validate_ip() {
+    local ip=$1
+    if [[ ! $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo_error "$ip does not appear to be a valid IPv4 address."
+        exit 1
+    fi
+}
+
+validate_ip "$SERVER1_IP"
+validate_ip "$SERVER2_IP"
+
+echo_msg "Setting up rsync between $SERVER1_IP and $SERVER2_IP"
+
+# Get the local IP address(es)
+LOCAL_IPS=$(hostname -I)
+echo_msg "Local IP address(es): $LOCAL_IPS"
+
+# Determine which server we're on by comparing IPs
+if [[ "$LOCAL_IPS" == *"$SERVER1_IP"* ]]; then
+    LOCAL_IP=$SERVER1_IP
+    REMOTE_IP=$SERVER2_IP
+    SERVER_NUM="1"
+elif [[ "$LOCAL_IPS" == *"$SERVER2_IP"* ]]; then
+    LOCAL_IP=$SERVER2_IP
+    REMOTE_IP=$SERVER1_IP
+    SERVER_NUM="2"
+else
+    echo_error "Could not find $SERVER1_IP or $SERVER2_IP in local IPs: $LOCAL_IPS"
+    echo_error "Please check your IP addresses and try again."
+    exit 1
+fi
+
+echo_msg "==========================================="
+echo_msg "DETECTED: Running on Server $SERVER_NUM ($LOCAL_IP)"
+echo_msg "Remote server is: Server $((3-SERVER_NUM)) ($REMOTE_IP)"
+echo_msg "==========================================="
+
+# Setup SSH directory
+SSH_DIR="$HOME/.ssh"
+KEY_FILE="$SSH_DIR/id_rsa_rsync"
+PUB_KEY_FILE="$KEY_FILE.pub"
+AUTH_KEYS_FILE="$SSH_DIR/authorized_keys"
+
+if [ ! -d "$SSH_DIR" ]; then
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+fi
+
+# Check if the key exists and if it needs to be updated
+check_key_update "$KEY_FILE" "$AUTH_KEYS_FILE" "$REMOTE_IP"
+KEY_UPDATED=$?
+
+# Get the public key
+PUBLIC_KEY=$(cat "$PUB_KEY_FILE")
+
+if [ -z "$PUBLIC_KEY" ]; then
+    echo_error "Failed to read public key. Please check if $PUB_KEY_FILE exists."
+    exit 1
+fi
+
+# Define remote user and server string
+read -p "Enter username for the remote server [$REMOTE_IP] (default: current user - $(whoami)): " REMOTE_USER
+if [ -z "$REMOTE_USER" ]; then
+    REMOTE_USER=$(whoami)
+fi
+REMOTE_SERVER="${REMOTE_USER}@${REMOTE_IP}"
+
+# Save configuration to file
+save_config
+
+# Server-specific operations
+if [ "$SERVER_NUM" == "1" ]; then
+    echo_msg "==== SERVER 1 SETUP ===="
+    echo_msg "Your public key to add on Server 2:"
+    echo
+    echo -e "${YELLOW}$PUBLIC_KEY${NC}"
+    echo
+
+    # Ask if Server 2 setup is complete
+    echo_msg "After running this script on Server 2, you'll be prompted to paste Server 2's public key."
+    read -p "Has Server 2 setup been completed? (y/n): " server2_done
+
+    if [[ "$server2_done" == "y" || "$server2_done" == "Y" ]]; then
+        # Get Server 2's public key
+        echo_msg "Please paste Server 2's public key:"
+        read REMOTE_PUBLIC_KEY
+
+        if [ -z "$REMOTE_PUBLIC_KEY" ]; then
+            echo_error "No public key provided. Exiting."
+            exit 1
+        fi
+
+        # Add the public key to authorized_keys
+        if [ ! -f "$AUTH_KEYS_FILE" ]; then
+            touch "$AUTH_KEYS_FILE"
+            chmod 600 "$AUTH_KEYS_FILE"
+        fi
+
+        # Check if the key is already in the file
+        if grep -q "$REMOTE_PUBLIC_KEY" "$AUTH_KEYS_FILE"; then
+            echo_warn "This public key is already in your authorized_keys file."
+        else
+            # Add the key
+            echo "$REMOTE_PUBLIC_KEY" >> "$AUTH_KEYS_FILE"
+            echo_msg "Server 2's public key added to authorized_keys."
+        fi
+
+        # Configure firewall if desired
+        read -p "Would you like to configure the firewall to allow connections from Server 2? (y/n): " config_fw
+        if [[ "$config_fw" == "y" || "$config_fw" == "Y" ]]; then
+            configure_firewall "$REMOTE_IP"
+        fi
+
+        # Test the connection to Server 2
+        echo_msg "Testing SSH connection to Server 2..."
+        test_ssh_connection "$REMOTE_SERVER" "$KEY_FILE"
+
+        if [ $? -eq 0 ]; then
+            echo_msg "==== SETUP SUCCESSFUL ===="
+            echo_msg "You can now use rsync with this command from Server 1:"
+            echo -e "${GREEN}rsync -avz --delete -e 'ssh -i $KEY_FILE' /path/to/source/ $REMOTE_SERVER:/path/to/destination/${NC}"
+            echo_msg "Or from Server 2 to Server 1:"
+            echo -e "${GREEN}rsync -avz --delete -e 'ssh -i ~/.ssh/id_rsa_rsync' /path/to/source/ $(whoami)@$LOCAL_IP:/path/to/destination/${NC}"
+            
+            echo_msg "==== QUICK RSYNC COMMAND GENERATOR ===="
+            echo_msg "To generate an rsync command using this configuration in the future, run:"
+            echo -e "${BLUE}$(basename "$0") --generate-command${NC}"
+            
+            # Ask if they want to generate a command now
+            read -p "Would you like to generate an rsync command now? (y/n): " gen_cmd
+            if [[ "$gen_cmd" == "y" || "$gen_cmd" == "Y" ]]; then
+                read -p "Enter source path (local): " source_path
+                read -p "Enter destination path (remote): " dest_path
+                
+                command=$(generate_rsync_command "$source_path" "$dest_path")
+                
+                echo_msg "Generated rsync command:"
+                echo -e "${GREEN}$command${NC}"
+                
+                read -p "Would you like to execute this command now? (y/n): " execute
+                if [[ "$execute" == "y" || "$execute" == "Y" ]]; then
+                    echo_msg "Executing rsync command..."
+                    eval "$command"
+                fi
+            fi
+        fi
+    else
+        echo_msg "==== NEXT STEPS ===="
+        echo_msg "1. Run this script on Server 2 with the same parameters:"
+        echo -e "${BLUE}./$(basename "$0") $SERVER1_IP $SERVER2_IP${NC}"
+        echo_msg "2. When prompted on Server 2, add the public key shown above"
+        echo_msg "3. Return to Server 1 and run this script again, selecting 'y' when asked if Server 2 setup is complete"
+        echo_msg "Note: The configuration has been saved for future use"
+    fi
+
+else # Server 2
+    echo_msg "==== SERVER 2 SETUP ===="
+    echo_msg "Your public key to add on Server 1:"
+    echo
+    echo -e "${YELLOW}$PUBLIC_KEY${NC}"
+    echo
+
+    # Get Server 1's public key
+    echo_msg "Please paste Server 1's public key:"
+    read REMOTE_PUBLIC_KEY
+
+    if [ -z "$REMOTE_PUBLIC_KEY" ]; then
+        echo_error "No public key provided. Exiting."
+        exit 1
+    fi
+
+    # Add the public key to authorized_keys
+    if [ ! -f "$AUTH_KEYS_FILE" ]; then
+        touch "$AUTH_KEYS_FILE"
+        chmod 600 "$AUTH_KEYS_FILE"
+    fi
+
+    # Check if the key is already in the file
+    if grep -q "$REMOTE_PUBLIC_KEY" "$AUTH_KEYS_FILE"; then
+        echo_warn "This public key is already in your authorized_keys file."
+    else
+        # Add the key
+        echo "$REMOTE_PUBLIC_KEY" >> "$AUTH_KEYS_FILE"
+        echo_msg "Server 1's public key added to authorized_keys."
+    fi
+
+    # Configure firewall if desired
+    read -p "Would you like to configure the firewall to allow connections from Server 1? (y/n): " config_fw
+    if [[ "$config_fw" == "y" || "$config_fw" == "Y" ]]; then
+        configure_firewall "$REMOTE_IP"
+    fi
+
+    # Test the connection to Server 1
+    echo_msg "Testing SSH connection to Server 1..."
+    test_ssh_connection "$REMOTE_SERVER" "$KEY_FILE"
+
+    if [ $? -eq 0 ]; then
+        echo_msg "==== SETUP SUCCESSFUL ===="
+        echo_msg "You can now use rsync with this command from Server 2:"
+        echo -e "${GREEN}rsync -avz --delete -e 'ssh -i $KEY_FILE' /path/to/source/ $REMOTE_SERVER:/path/to/destination/${NC}"
+        echo_msg "Or from Server 1 to Server 2:"
+        echo -e "${GREEN}rsync -avz --delete -e 'ssh -i ~/.ssh/id_rsa_rsync' /path/to/source/ $(whoami)@$LOCAL_IP:/path/to/destination/${NC}"
+        
+        echo_msg "==== QUICK RSYNC COMMAND GENERATOR ===="
+        echo_msg "To generate an rsync command using this configuration in the future, run:"
+        echo -e "${BLUE}$(basename "$0") --generate-command${NC}"
+        
+        # Ask if they want to generate a command now
+        read -p "Would you like to generate an rsync command now? (y/n): " gen_cmd
+        if [[ "$gen_cmd" == "y" || "$gen_cmd" == "Y" ]]; then
+            read -p "Enter source path (local): " source_path
+            read -p "Enter destination path (remote): " dest_path
+            
+            command=$(generate_rsync_command "$source_path" "$dest_path")
+            
+            echo_msg "Generated rsync command:"
+            echo -e "${GREEN}$command${NC}"
+            
+            read -p "Would you like to execute this command now? (y/n): " execute
+            if [[ "$execute" == "y" || "$execute" == "Y" ]]; then
+                echo_msg "Executing rsync command..."
+                eval "$command"
+            fi
+        fi
+    else
+        echo_msg "==== NEXT STEPS ===="
+        echo_msg "Return to Server 1 and run the script again to complete setup."
+        echo_msg "Note: The configuration has been saved for future use"
+    fi
+fi
+
+echo_msg "Script completed."
+echo_msg "Additional options:"
+echo_msg "  - To force a new configuration: $(basename "$0") --force-new"
+echo_msg "  - To generate an rsync command: $(basename "$0") --generate-command"
