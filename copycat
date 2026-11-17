@@ -3,14 +3,16 @@
 #
 # Usage:  copycat <filename>
 #         some_command | copycat
-#         copycat --test            send "COPYCAT_TEST" to verify OSC52 works
+#         copycat --test       copy a known test string
+#         copycat --doctor     show detected environment, tools, and fixes
 #
 # Env overrides:
 #   COPYCAT_METHOD=auto|native|osc52|file   (default: auto)
 #   OSC52_TARGET=c|p|pc|s                   (default: c)
 #   OSC52_TERM=bel|st                       (default: bel)
 #   OSC52_MAX=<bytes>                       max base64 size (default 100000)
-#   COPYCAT_FORCE=1                         ignore the size limit
+#   COPYCAT_FORCE=1                         ignore OSC52 size limit / VTE skip
+#   COPYCAT_NOVERIFY=1                      skip read-back verification
 #   COPYCAT_QUIET=1                         suppress status messages
 
 OSC52_MAX="${OSC52_MAX:-100000}"
@@ -22,24 +24,145 @@ OS="$(uname -s 2>/dev/null)"
 have() { command -v "$1" >/dev/null 2>&1; }
 msg()  { [ -n "${COPYCAT_QUIET:-}" ] || echo "$@" >&2; }
 
-is_ssh() { [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]; }
-is_wsl() { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }
+is_ssh()      { [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]; }
+is_wsl()      { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }
 is_winposix() { case "$OS" in CYGWIN*|MSYS*|MINGW*) return 0;; esac; return 1; }
-can_tty() { ( : > /dev/tty ) 2>/dev/null; }
+is_vte()      { [ -n "${VTE_VERSION:-}" ]; }   # Guake, GNOME Terminal, Tilix, Terminator...
+can_tty()     { ( : > /dev/tty ) 2>/dev/null; }
+
+# ---------- Package-manager helper ----------
+# usage: install_cmd pkg1 pkg2 ...   (prints a full install command, or nothing)
+install_cmd() {
+    if   have apt-get; then echo "sudo apt install $*"
+    elif have pacman;  then echo "sudo pacman -S $*"
+    elif have dnf;     then echo "sudo dnf install $*"
+    elif have zypper;  then echo "sudo zypper install $*"
+    elif have apk;     then echo "sudo apk add $*"
+    elif have xbps-install; then echo "sudo xbps-install $*"
+    elif have emerge;  then echo "sudo emerge $*"
+    elif have brew;    then echo "brew install $*"
+    fi
+}
+
+# ---------- Hints: what to install / change when nothing works ----------
+show_hints() {
+    local cmd session="${XDG_SESSION_TYPE:-unknown}" desk="${XDG_CURRENT_DESKTOP:-unknown}"
+    msg ""
+    msg "---- copycat hints ----"
+    msg "Environment: session=$session desktop=$desk ssh=$(is_ssh && echo yes || echo no)"
+    msg "              DISPLAY=${DISPLAY:-<unset>} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>}"
+
+    if [ "$OS" = "Darwin" ]; then
+        msg "macOS: pbcopy should be built in. Check that it is in your PATH."
+
+    elif have termux-setup-storage; then
+        msg "Termux: install the API tools and the Termux:API app:"
+        msg "  pkg install termux-api"
+
+    elif is_wsl; then
+        msg "WSL: clip.exe should be available. If not, check that Windows interop is enabled,"
+        msg "or install win32yank (https://github.com/equalsraf/win32yank)."
+
+    elif is_ssh; then
+        msg "You are on SSH. Options, easiest first:"
+        msg ""
+        msg " 1) X11 forwarding (no size limit, works with any local terminal incl. Guake):"
+        cmd=$(install_cmd xclip xauth)
+        msg "    On this server:  ${cmd:-install xclip and xauth}"
+        msg "      (xauth package names: Debian/Ubuntu 'xauth', Arch 'xorg-xauth', Fedora 'xorg-x11-xauth')"
+        msg "    Reconnect with:  ssh -X user@host     (or ssh -Y if -X gives auth errors)"
+        msg "    Then check:      echo \$DISPLAY   (should not be empty)"
+        msg ""
+        msg " 2) Pull instead of push. Put this in your LOCAL ~/.bashrc (needs xclip or wl-copy locally):"
+        msg "    rcopy() { ssh user@host \"cat -- '\$1'\" | xclip -selection clipboard; }"
+        msg "    Then, locally:  rcopy /path/on/server/file"
+        msg ""
+        msg " 3) OSC52 (only if your LOCAL terminal supports it):"
+        msg "    Works: kitty, WezTerm, Alacritty, foot, iTerm2, Windows Terminal."
+        msg "    Does NOT work: Guake, GNOME Terminal, Tilix, Terminator, macOS Terminal.app."
+        msg "    Try:  copycat --test"
+
+    elif [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+        msg "No working clipboard tool found. Install one:"
+        case "$session:$desk" in
+            *GNOME*|*gnome*)
+                cmd=$(install_cmd xclip)
+                msg "  Recommended (GNOME, works via XWayland): ${cmd:-install xclip}" ;;
+            wayland:*)
+                cmd=$(install_cmd wl-clipboard)
+                msg "  Recommended (Wayland): ${cmd:-install wl-clipboard}"
+                cmd=$(install_cmd xclip)
+                msg "  Also useful for XWayland apps: ${cmd:-install xclip}" ;;
+            *)
+                cmd=$(install_cmd xclip)
+                msg "  Recommended (X11): ${cmd:-install xclip}"
+                cmd=$(install_cmd xsel)
+                msg "  Alternative:       ${cmd:-install xsel}" ;;
+        esac
+        if [ -z "${DISPLAY:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+            msg "  Note: DISPLAY is unset, so xclip can't be used here. Prefer wl-clipboard."
+            cmd=$(install_cmd wl-clipboard)
+            msg "        ${cmd:-install wl-clipboard}"
+        fi
+    else
+        msg "No desktop session detected (DISPLAY and WAYLAND_DISPLAY are both unset)."
+        msg "  If this terminal was launched outside your desktop (e.g. Guake started by a"
+        msg "  service), restart it from inside your desktop session."
+        msg "  On a headless box, use OSC52 with a supporting terminal, or the saved file."
+    fi
+
+    if is_vte && ! is_ssh; then
+        msg ""
+        msg "Note: this terminal is VTE-based (Guake/GNOME Terminal) and ignores OSC52,"
+        msg "so a native tool (xclip / wl-clipboard) is required."
+    fi
+    if [ -n "${TMUX:-}" ]; then
+        msg ""
+        msg "tmux detected. For OSC52 passthrough, run on this host:"
+        msg "  tmux set -g set-clipboard on && tmux set -g allow-passthrough on"
+    fi
+    msg "-----------------------"
+}
+
+doctor() {
+    echo "copycat environment report"
+    echo "  OS:              $OS"
+    echo "  session type:    ${XDG_SESSION_TYPE:-unknown}"
+    echo "  desktop:         ${XDG_CURRENT_DESKTOP:-unknown}"
+    echo "  DISPLAY:         ${DISPLAY:-<unset>}"
+    echo "  WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-<unset>}"
+    echo "  SSH session:     $(is_ssh && echo yes || echo no)"
+    echo "  WSL:             $(is_wsl && echo yes || echo no)"
+    echo "  tmux:            $([ -n "${TMUX:-}" ] && echo yes || echo no)"
+    echo "  VTE terminal:    $(is_vte && echo yes || echo no)"
+    echo "  controlling tty: $(can_tty && echo yes || echo no)"
+    echo "  tools:"
+    for t in pbcopy xclip xsel wl-copy wl-paste termux-clipboard-set win32yank.exe clip.exe base64 timeout; do
+        printf '    %-22s %s\n' "$t" "$(have "$t" && echo found || echo missing)"
+    done
+    COPYCAT_QUIET= show_hints 2>&1
+    exit 0
+}
 
 # ---------- Input ----------
+case "${1:-}" in
+    --doctor|--hints) doctor ;;
+    -h|--help)
+        sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+        exit 0 ;;
+esac
+
 tmp=$(mktemp "${TMPDIR:-/tmp}/copycat.XXXXXX") || exit 1
 trap 'rm -f "$tmp"' EXIT
 
-if [ "$1" = "--test" ]; then
+if [ "${1:-}" = "--test" ]; then
     printf 'COPYCAT_TEST' > "$tmp"
     label="test string"
-    [ "$METHOD" = "auto" ] && METHOD="osc52"
 elif [ $# -eq 0 ]; then
     if [ -t 0 ]; then
         echo "Usage: copycat <filename>"
         echo "       some_command | copycat"
-        echo "       copycat --test"
+        echo "       copycat --test | --doctor"
         exit 1
     fi
     label="stdin"
@@ -59,42 +182,83 @@ if [ ! -s "$tmp" ]; then
 fi
 bytes=$(wc -c < "$tmp" | tr -d ' ')
 
-# ---------- Native clipboard tools ----------
+# ---------- Native tools (each returns 0 only on success) ----------
 METHOD_USED=""
-copy_native() {
-    if [ "$OS" = "Darwin" ] && have pbcopy; then
-        METHOD_USED="pbcopy"; pbcopy < "$tmp"
-    elif have termux-clipboard-set; then
-        METHOD_USED="termux-clipboard-set"; termux-clipboard-set < "$tmp"
-    elif is_winposix && [ -c /dev/clipboard ]; then
-        METHOD_USED="/dev/clipboard"; cat "$tmp" > /dev/clipboard
-    elif is_wsl && have win32yank.exe; then
-        METHOD_USED="win32yank.exe"; win32yank.exe -i < "$tmp"
-    elif have clip.exe && { is_wsl || is_winposix; }; then
-        METHOD_USED="clip.exe"
-        if have iconv; then
-            { printf '\377\376'; iconv -f UTF-8 -t UTF-16LE "$tmp"; } | clip.exe
-        else
-            clip.exe < "$tmp"
-        fi
-    elif [ -n "${WAYLAND_DISPLAY:-}" ] && have wl-copy; then
-        METHOD_USED="wl-copy"
-        wl-copy < "$tmp" >/dev/null 2>&1 && { wl-copy --primary < "$tmp" >/dev/null 2>&1 || true; }
-    elif [ -n "${DISPLAY:-}" ] && have xclip; then
-        METHOD_USED="xclip"
-        xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1 \
-            && { xclip -selection primary -in < "$tmp" >/dev/null 2>&1 || true; }
-    elif [ -n "${DISPLAY:-}" ] && have xsel; then
-        METHOD_USED="xsel"
-        xsel --clipboard --input < "$tmp" >/dev/null 2>&1 \
-            && { xsel --primary --input < "$tmp" >/dev/null 2>&1 || true; }
+
+# Read back the clipboard and compare, so we never report a false success.
+# usage: verify <read-command...>
+verify() {
+    [ -n "${COPYCAT_NOVERIFY:-}" ] && return 0
+    have timeout || return 0
+    timeout 2 "$@" 2>/dev/null | cmp -s - "$tmp"
+}
+
+try_pbcopy() {
+    [ "$OS" = "Darwin" ] && have pbcopy || return 1
+    pbcopy < "$tmp" && METHOD_USED="pbcopy"
+}
+try_termux() {
+    have termux-clipboard-set || return 1
+    termux-clipboard-set < "$tmp" && METHOD_USED="termux-clipboard-set"
+}
+try_devclipboard() {
+    is_winposix && [ -c /dev/clipboard ] || return 1
+    cat "$tmp" > /dev/clipboard && METHOD_USED="/dev/clipboard"
+}
+try_win32yank() {
+    is_wsl && have win32yank.exe || return 1
+    win32yank.exe -i < "$tmp" && METHOD_USED="win32yank.exe"
+}
+try_clipexe() {
+    have clip.exe && { is_wsl || is_winposix; } || return 1
+    if have iconv; then
+        { printf '\377\376'; iconv -f UTF-8 -t UTF-16LE "$tmp"; } | clip.exe || return 1
     else
-        return 1
+        clip.exe < "$tmp" || return 1
     fi
+    METHOD_USED="clip.exe"
+}
+try_xclip() {   # preferred on Linux, including GNOME/Wayland via XWayland
+    [ -n "${DISPLAY:-}" ] && have xclip || return 1
+    xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1 || return 1
+    verify xclip -selection clipboard -o || return 1
+    xclip -selection primary -in < "$tmp" >/dev/null 2>&1 || true
+    METHOD_USED="xclip"
+}
+try_xsel() {
+    [ -n "${DISPLAY:-}" ] && have xsel || return 1
+    xsel --clipboard --input < "$tmp" >/dev/null 2>&1 || return 1
+    verify xsel --clipboard --output || return 1
+    xsel --primary --input < "$tmp" >/dev/null 2>&1 || true
+    METHOD_USED="xsel"
+}
+try_wlcopy() {  # bounded: wl-copy can hang on GNOME, so never wait more than 3s
+    [ -n "${WAYLAND_DISPLAY:-}" ] && have wl-copy || return 1
+    if have timeout; then
+        timeout 3 wl-copy --type text/plain < "$tmp" >/dev/null 2>&1 || return 1
+    else
+        wl-copy --type text/plain < "$tmp" >/dev/null 2>&1 || return 1
+    fi
+    have wl-paste && { verify wl-paste --no-newline || return 1; }
+    METHOD_USED="wl-copy"
+}
+
+copy_native() {
+    local f
+    for f in try_pbcopy try_termux try_devclipboard try_win32yank try_clipexe \
+             try_xclip try_xsel try_wlcopy; do
+        "$f" && return 0
+    done
+    return 1
 }
 
 # ---------- OSC52 ----------
 copy_osc52() {
+    # VTE terminals (Guake etc.) ignore OSC52; don't pretend it worked
+    if is_vte && [ -z "${COPYCAT_FORCE:-}" ] && [ "$label" != "test string" ]; then
+        msg "Skipping OSC52: VTE-based terminals (Guake, GNOME Terminal) don't support it."
+        return 1
+    fi
     can_tty || { msg "No controlling terminal (/dev/tty) available for OSC52"; return 1; }
 
     local encoded
@@ -103,6 +267,7 @@ copy_osc52() {
     elif have openssl; then
         encoded=$(openssl base64 -A < "$tmp")
     else
+        msg "OSC52 needs base64 or openssl, neither found."
         return 1
     fi
 
@@ -112,26 +277,22 @@ copy_osc52() {
         return 1
     fi
 
-    local end
+    local end seq
     if [ "$OSC52_TERM" = "st" ]; then end=$'\033\\'; else end=$'\a'; fi
-    local seq
     seq=$(printf '\033]52;%s;%s' "$OSC52_TARGET" "$encoded")
     seq="${seq}${end}"
 
     if [ -n "${TMUX:-}" ]; then
-        # Load tmux's own buffer; -w also asks tmux to forward to the system clipboard
         if have tmux; then
             tmux load-buffer -w "$tmp" 2>/dev/null || tmux load-buffer "$tmp" 2>/dev/null
             local pt
             pt=$(tmux show -gv allow-passthrough 2>/dev/null)
             if [ "$pt" != "on" ] && [ "$pt" != "all" ]; then
-                msg "Note: tmux allow-passthrough is '${pt:-off}'. Add 'set -g allow-passthrough on' to ~/.tmux.conf"
+                msg "Note: tmux allow-passthrough is '${pt:-off}'. Run: tmux set -g allow-passthrough on"
             fi
         fi
-        # DCS passthrough: every ESC inside must be doubled
         printf '\033Ptmux;%s\033\\' "${seq//$'\033'/$'\033\033'}" > /dev/tty
     elif [[ "${TERM:-}" == screen* ]]; then
-        # screen drops DCS longer than ~768 bytes, so send in chunks
         printf '%s' "$seq" | fold -w 700 | while IFS= read -r chunk || [ -n "$chunk" ]; do
             printf '\033P%s\033\\' "$chunk"
         done > /dev/tty
@@ -147,63 +308,43 @@ copy_file() {
     mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
     cp "$tmp" "$dir/last" || return 1
     METHOD_USED="file"
-    msg "No clipboard method worked. Saved to: $dir/last"
+    msg "Saved to: $dir/last"
 }
-# ---------- Hints ----------
-osc52_hints() {
-    msg ""
-    msg "If nothing pasted, your local terminal is likely blocking OSC52."
-    msg "This must be changed on your LOCAL machine, not this server:"
 
-    local t="${TERM_PROGRAM:-}${LC_TERMINAL:-}"
-    if   [ -n "${KITTY_WINDOW_ID:-}" ] || [[ "$TERM" == *kitty* ]]; then
-        msg "  kitty: add to kitty.conf:  clipboard_control write-clipboard write-primary"
-    elif [[ "$t" == *iTerm* ]]; then
-        msg "  iTerm2: run on your Mac:  defaults write com.googlecode.iterm2 AllowClipboardAccess -bool true"
-        msg "          then restart iTerm2 (or Settings > General > Selection > allow clipboard access)"
-    elif [ -n "${ALACRITTY_LOG:-}${ALACRITTY_SOCKET:-}" ] || [[ "$TERM" == alacritty* ]]; then
-        msg "  Alacritty: in alacritty.toml add:  [terminal]  osc52 = \"CopyPaste\""
-    elif [ -n "${WT_SESSION:-}" ]; then
-        msg "  Windows Terminal: supported by default. Paste with Ctrl+Shift+V."
-    elif [ -n "${VTE_VERSION:-}" ]; then
-        msg "  VTE terminals (GNOME Terminal, Tilix, Terminator) don't support OSC52. Try kitty, WezTerm or Alacritty."
-    else
-        msg "  Terminal not detected (env vars often aren't forwarded over SSH). Common fixes:"
-        msg "    iTerm2:    defaults write com.googlecode.iterm2 AllowClipboardAccess -bool true"
-        msg "    kitty:     clipboard_control write-clipboard write-primary"
-        msg "    Alacritty: [terminal] osc52 = \"CopyPaste\""
-        msg "    PuTTY:     Terminal > Features > allow remote-controlled clipboard access"
-        msg "    GNOME Terminal / Terminal.app: unsupported, use another terminal"
-    fi
-
-    if [ -n "${TMUX:-}" ]; then
-        msg "  tmux (run on this host):"
-        msg "    tmux set -g set-clipboard on && tmux set -g allow-passthrough on"
-    fi
-}
 # ---------- Choose order ----------
-case "$METHOD" in
-    native) order="native" ;;
-    osc52)  order="osc52" ;;
-    file)   order="file" ;;
-    *)
-        if is_ssh; then order="osc52 native file"
-        else order="native osc52 file"; fi ;;
-esac
+if [ "${1:-}" = "--test" ] && [ "$METHOD" = "auto" ]; then
+    # --test checks both paths: native first, then OSC52
+    order="native osc52"
+else
+    case "$METHOD" in
+        native) order="native" ;;
+        osc52)  order="osc52" ;;
+        file)   order="file" ;;
+        *)
+            if is_ssh && [ -z "${DISPLAY:-}" ]; then order="osc52 native file"
+            else order="native osc52 file"; fi ;;
+    esac
+fi
 
 for m in $order; do
     if "copy_$m"; then
         case "$METHOD_USED" in
             OSC52)
                 msg "Sent $label ($bytes bytes) via OSC52 (target=$OSC52_TARGET). Delivery can't be verified."
-                msg "If nothing pastes, your terminal is blocking OSC52. Run: copycat --test"
+                msg "If nothing pastes, run: copycat --doctor"
                 ;;
-            file) ;;
-            *) msg "Copied $label ($bytes bytes) to clipboard via $METHOD_USED" ;;
+            file)
+                msg "No clipboard method worked."
+                show_hints
+                ;;
+            *)
+                msg "Copied $label ($bytes bytes) to clipboard via $METHOD_USED"
+                ;;
         esac
         exit 0
     fi
 done
 
 echo "Error: could not copy to clipboard" >&2
+show_hints
 exit 1
