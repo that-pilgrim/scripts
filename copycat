@@ -1,5 +1,5 @@
 #!/bin/bash
-# copycat - Copy file contents to clipboard
+# copycat - Copy file contents to clipboard (CLIPBOARD + PRIMARY)
 # Usage: copycat <filename>
 #        some_command | copycat
 #
@@ -46,24 +46,22 @@ copy_via_osc52() {
         return 1
     fi
 
-    # Write to the terminal directly, not stdout
     local out=/dev/tty
     [ -w "$out" ] || out=/dev/stdout
 
+    # "pc" = set both PRIMARY (Shift+Insert) and CLIPBOARD (Ctrl+V)
     if [ -n "$TMUX" ]; then
-        # tmux: pass through to the outer terminal (needs: set -g allow-passthrough on)
-        printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$encoded" > "$out"
+        printf '\033Ptmux;\033\033]52;pc;%s\a\033\\' "$encoded" > "$out"
     elif [[ "$TERM" == screen* ]]; then
-        printf '\033P\033]52;c;%s\a\033\\' "$encoded" > "$out"
+        printf '\033P\033]52;pc;%s\a\033\\' "$encoded" > "$out"
     else
-        printf '\033]52;c;%s\a' "$encoded" > "$out"
+        printf '\033]52;pc;%s\a' "$encoded" > "$out"
     fi
 }
 
 ok() { echo "Contents of $label copied to clipboard ($(wc -c < "$tmp" | tr -d ' ') bytes)"; }
 
 if [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
-    # SSH session: OSC52 sends it to your *local* clipboard
     if copy_via_osc52; then
         echo "Contents of $label sent to local clipboard via OSC52"
         echo "(Make sure your terminal supports OSC52 clipboard integration)"
@@ -73,14 +71,15 @@ if [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
 elif command -v pbcopy >/dev/null 2>&1; then
     pbcopy < "$tmp" && ok
 elif [ -n "$WAYLAND_DISPLAY" ] && command -v wl-copy >/dev/null 2>&1; then
-    wl-copy < "$tmp" && ok
+    wl-copy < "$tmp" && wl-copy --primary < "$tmp" && ok
 elif [ -n "$DISPLAY" ] && command -v xclip >/dev/null 2>&1; then
-    # xclip forks to hold the selection; detach its output so it doesn't hang
-    xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1 && ok
+    # Set both selections; each xclip forks to hold its selection
+    xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1 \
+        && xclip -selection primary -in < "$tmp" >/dev/null 2>&1 && ok
 elif [ -n "$DISPLAY" ] && command -v xsel >/dev/null 2>&1; then
-    xsel --clipboard --input < "$tmp" >/dev/null 2>&1 && ok
+    xsel --clipboard --input < "$tmp" >/dev/null 2>&1 \
+        && xsel --primary --input < "$tmp" >/dev/null 2>&1 && ok
 elif command -v clip.exe >/dev/null 2>&1; then
-    # WSL/Windows
     clip.exe < "$tmp" && ok
 else
     echo "No clipboard utility available. Contents of $label:"
