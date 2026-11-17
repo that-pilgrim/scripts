@@ -1,6 +1,6 @@
 # Shell Scripts Index
 
-A collection of useful shell scripts for system administration, automation, and general utilities.
+A collection of useful shell scripts for system administration, automation, and general utilities.  AI did the gruntwork.
 
 ## Scripts
 
