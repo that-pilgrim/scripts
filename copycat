@@ -1,0 +1,49 @@
+#!/bin/bash
+# copycat - Copy file contents to clipboard
+# Usage: copycat <filename>
+if [ $# -eq 0 ]; then
+    echo "Usage: copycat <filename>"
+    echo "Copies the contents of a file to the clipboard"
+    exit 1
+fi
+if [ ! -f "$1" ]; then
+    echo "Error: File '$1' not found"
+    exit 1
+fi
+# Function to copy via OSC52 (works over SSH)
+copy_via_osc52() {
+    local content="$1"
+    local encoded=$(printf '%s' "$content" | base64 | tr -d '\n')
+    printf '\033]52;c;%s\a' "$encoded"
+}
+# Get file contents
+content=$(cat "$1")
+# Detect the system and use appropriate clipboard command
+if command -v pbcopy >/dev/null 2>&1; then
+    # macOS
+    echo "$content" | pbcopy
+    echo "Contents of '$1' copied to clipboard"
+elif [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
+    # We're in an SSH session - try OSC52
+    copy_via_osc52 "$content"
+    echo "Contents of '$1' sent to local clipboard via OSC52"
+    echo "(Make sure your terminal supports OSC52 clipboard integration)"
+elif command -v xclip >/dev/null 2>&1 && [ -n "$DISPLAY" ]; then
+    # Linux with xclip and display
+    echo "$content" | xclip -selection clipboard
+    echo "Contents of '$1' copied to clipboard"
+elif command -v xsel >/dev/null 2>&1 && [ -n "$DISPLAY" ]; then
+    # Linux with xsel and display
+    echo "$content" | xsel --clipboard --input
+    echo "Contents of '$1' copied to clipboard"
+elif command -v clip.exe >/dev/null 2>&1; then
+    # WSL/Windows
+    echo "$content" | clip.exe
+    echo "Contents of '$1' copied to clipboard"
+else
+    # Fallback: just display the content
+    echo "No clipboard utility available. Contents of '$1':"
+    echo "=========================================="
+    echo "$content"
+    echo "=========================================="
+fi
