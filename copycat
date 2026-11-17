@@ -1,49 +1,90 @@
 #!/bin/bash
 # copycat - Copy file contents to clipboard
 # Usage: copycat <filename>
+#        some_command | copycat
+#
+# Env: OSC52_MAX  max base64 bytes to send via OSC52 (default 100000)
+
+OSC52_MAX="${OSC52_MAX:-100000}"
+
+# Input: file argument or stdin
 if [ $# -eq 0 ]; then
-    echo "Usage: copycat <filename>"
-    echo "Copies the contents of a file to the clipboard"
+    if [ -t 0 ]; then
+        echo "Usage: copycat <filename>"
+        echo "Copies the contents of a file to the clipboard"
+        exit 1
+    fi
+    src="-"
+    label="stdin"
+else
+    src="$1"
+    label="'$1'"
+    if [ ! -f "$src" ]; then
+        echo "Error: File '$src' not found" >&2
+        exit 1
+    fi
+fi
+
+# Stream the input into a temp file so every method gets exact bytes
+tmp=$(mktemp "${TMPDIR:-/tmp}/copycat.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT
+if [ "$src" = "-" ]; then cat > "$tmp"; else cat -- "$src" > "$tmp"; fi
+
+if [ ! -s "$tmp" ]; then
+    echo "Warning: $label is empty, nothing copied" >&2
     exit 1
 fi
-if [ ! -f "$1" ]; then
-    echo "Error: File '$1' not found"
-    exit 1
-fi
-# Function to copy via OSC52 (works over SSH)
+
 copy_via_osc52() {
-    local content="$1"
-    local encoded=$(printf '%s' "$content" | base64 | tr -d '\n')
-    printf '\033]52;c;%s\a' "$encoded"
+    local encoded size
+    encoded=$(base64 < "$tmp" | tr -d '\n\r')
+    size=${#encoded}
+
+    if [ "$size" -gt "$OSC52_MAX" ]; then
+        echo "Warning: $size bytes (base64) exceeds OSC52 limit of $OSC52_MAX." >&2
+        echo "Many terminals will silently drop this. Raise OSC52_MAX to try anyway." >&2
+        return 1
+    fi
+
+    # Write to the terminal directly, not stdout
+    local out=/dev/tty
+    [ -w "$out" ] || out=/dev/stdout
+
+    if [ -n "$TMUX" ]; then
+        # tmux: pass through to the outer terminal (needs: set -g allow-passthrough on)
+        printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$encoded" > "$out"
+    elif [[ "$TERM" == screen* ]]; then
+        printf '\033P\033]52;c;%s\a\033\\' "$encoded" > "$out"
+    else
+        printf '\033]52;c;%s\a' "$encoded" > "$out"
+    fi
 }
-# Get file contents
-content=$(cat "$1")
-# Detect the system and use appropriate clipboard command
-if command -v pbcopy >/dev/null 2>&1; then
-    # macOS
-    echo "$content" | pbcopy
-    echo "Contents of '$1' copied to clipboard"
-elif [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
-    # We're in an SSH session - try OSC52
-    copy_via_osc52 "$content"
-    echo "Contents of '$1' sent to local clipboard via OSC52"
-    echo "(Make sure your terminal supports OSC52 clipboard integration)"
-elif command -v xclip >/dev/null 2>&1 && [ -n "$DISPLAY" ]; then
-    # Linux with xclip and display
-    echo "$content" | xclip -selection clipboard
-    echo "Contents of '$1' copied to clipboard"
-elif command -v xsel >/dev/null 2>&1 && [ -n "$DISPLAY" ]; then
-    # Linux with xsel and display
-    echo "$content" | xsel --clipboard --input
-    echo "Contents of '$1' copied to clipboard"
+
+ok() { echo "Contents of $label copied to clipboard ($(wc -c < "$tmp" | tr -d ' ') bytes)"; }
+
+if [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
+    # SSH session: OSC52 sends it to your *local* clipboard
+    if copy_via_osc52; then
+        echo "Contents of $label sent to local clipboard via OSC52"
+        echo "(Make sure your terminal supports OSC52 clipboard integration)"
+    else
+        exit 1
+    fi
+elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$tmp" && ok
+elif [ -n "$WAYLAND_DISPLAY" ] && command -v wl-copy >/dev/null 2>&1; then
+    wl-copy < "$tmp" && ok
+elif [ -n "$DISPLAY" ] && command -v xclip >/dev/null 2>&1; then
+    # xclip forks to hold the selection; detach its output so it doesn't hang
+    xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1 && ok
+elif [ -n "$DISPLAY" ] && command -v xsel >/dev/null 2>&1; then
+    xsel --clipboard --input < "$tmp" >/dev/null 2>&1 && ok
 elif command -v clip.exe >/dev/null 2>&1; then
     # WSL/Windows
-    echo "$content" | clip.exe
-    echo "Contents of '$1' copied to clipboard"
+    clip.exe < "$tmp" && ok
 else
-    # Fallback: just display the content
-    echo "No clipboard utility available. Contents of '$1':"
+    echo "No clipboard utility available. Contents of $label:"
     echo "=========================================="
-    echo "$content"
+    cat "$tmp"
     echo "=========================================="
 fi
