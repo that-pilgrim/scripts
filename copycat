@@ -149,7 +149,38 @@ copy_file() {
     METHOD_USED="file"
     msg "No clipboard method worked. Saved to: $dir/last"
 }
+# ---------- Hints ----------
+osc52_hints() {
+    msg ""
+    msg "If nothing pasted, your local terminal is likely blocking OSC52."
+    msg "This must be changed on your LOCAL machine, not this server:"
 
+    local t="${TERM_PROGRAM:-}${LC_TERMINAL:-}"
+    if   [ -n "${KITTY_WINDOW_ID:-}" ] || [[ "$TERM" == *kitty* ]]; then
+        msg "  kitty: add to kitty.conf:  clipboard_control write-clipboard write-primary"
+    elif [[ "$t" == *iTerm* ]]; then
+        msg "  iTerm2: run on your Mac:  defaults write com.googlecode.iterm2 AllowClipboardAccess -bool true"
+        msg "          then restart iTerm2 (or Settings > General > Selection > allow clipboard access)"
+    elif [ -n "${ALACRITTY_LOG:-}${ALACRITTY_SOCKET:-}" ] || [[ "$TERM" == alacritty* ]]; then
+        msg "  Alacritty: in alacritty.toml add:  [terminal]  osc52 = \"CopyPaste\""
+    elif [ -n "${WT_SESSION:-}" ]; then
+        msg "  Windows Terminal: supported by default. Paste with Ctrl+Shift+V."
+    elif [ -n "${VTE_VERSION:-}" ]; then
+        msg "  VTE terminals (GNOME Terminal, Tilix, Terminator) don't support OSC52. Try kitty, WezTerm or Alacritty."
+    else
+        msg "  Terminal not detected (env vars often aren't forwarded over SSH). Common fixes:"
+        msg "    iTerm2:    defaults write com.googlecode.iterm2 AllowClipboardAccess -bool true"
+        msg "    kitty:     clipboard_control write-clipboard write-primary"
+        msg "    Alacritty: [terminal] osc52 = \"CopyPaste\""
+        msg "    PuTTY:     Terminal > Features > allow remote-controlled clipboard access"
+        msg "    GNOME Terminal / Terminal.app: unsupported, use another terminal"
+    fi
+
+    if [ -n "${TMUX:-}" ]; then
+        msg "  tmux (run on this host):"
+        msg "    tmux set -g set-clipboard on && tmux set -g allow-passthrough on"
+    fi
+}
 # ---------- Choose order ----------
 case "$METHOD" in
     native) order="native" ;;
