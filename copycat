@@ -1,89 +1,171 @@
-#!/bin/bash
-# copycat - Copy file contents to clipboard (CLIPBOARD + PRIMARY)
-# Usage: copycat <filename>
-#        some_command | copycat
+#!/usr/bin/env bash
+# copycat - Copy file contents (or stdin) to the clipboard, on any system.
 #
-# Env: OSC52_MAX  max base64 bytes to send via OSC52 (default 100000)
+# Usage:  copycat <filename>
+#         some_command | copycat
+#
+# Env overrides:
+#   COPYCAT_METHOD=auto|native|osc52|file   (default: auto)
+#   OSC52_MAX=<bytes>                       max base64 size for OSC52 (default 100000)
+#   COPYCAT_FORCE=1                         send OSC52 even if over the size limit
+#   COPYCAT_QUIET=1                         suppress status messages
 
 OSC52_MAX="${OSC52_MAX:-100000}"
+METHOD="${COPYCAT_METHOD:-auto}"
+OS="$(uname -s 2>/dev/null)"
 
-# Input: file argument or stdin
+have() { command -v "$1" >/dev/null 2>&1; }
+msg()  { [ -n "${COPYCAT_QUIET:-}" ] || echo "$@" >&2; }
+
+is_ssh() { [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]; }
+is_wsl() { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }
+is_winposix() { case "$OS" in CYGWIN*|MSYS*|MINGW*) return 0;; esac; return 1; }
+can_tty() { ( : > /dev/tty ) 2>/dev/null; }
+
+# ---------- Input ----------
 if [ $# -eq 0 ]; then
     if [ -t 0 ]; then
         echo "Usage: copycat <filename>"
-        echo "Copies the contents of a file to the clipboard"
+        echo "       some_command | copycat"
         exit 1
     fi
-    src="-"
-    label="stdin"
+    src="-"; label="stdin"
 else
-    src="$1"
-    label="'$1'"
+    src="$1"; label="'$1'"
     if [ ! -f "$src" ]; then
         echo "Error: File '$src' not found" >&2
         exit 1
     fi
 fi
 
-# Stream the input into a temp file so every method gets exact bytes
 tmp=$(mktemp "${TMPDIR:-/tmp}/copycat.XXXXXX") || exit 1
 trap 'rm -f "$tmp"' EXIT
 if [ "$src" = "-" ]; then cat > "$tmp"; else cat -- "$src" > "$tmp"; fi
 
 if [ ! -s "$tmp" ]; then
-    echo "Warning: $label is empty, nothing copied" >&2
+    msg "Warning: $label is empty, nothing copied"
     exit 1
 fi
+bytes=$(wc -c < "$tmp" | tr -d ' ')
 
-copy_via_osc52() {
-    local encoded size
-    encoded=$(base64 < "$tmp" | tr -d '\n\r')
-    size=${#encoded}
+# ---------- Method: native clipboard tools ----------
+METHOD_USED=""
+copy_native() {
+    if [ "$OS" = "Darwin" ] && have pbcopy; then
+        METHOD_USED="pbcopy"
+        pbcopy < "$tmp"
 
-    if [ "$size" -gt "$OSC52_MAX" ]; then
-        echo "Warning: $size bytes (base64) exceeds OSC52 limit of $OSC52_MAX." >&2
-        echo "Many terminals will silently drop this. Raise OSC52_MAX to try anyway." >&2
-        return 1
-    fi
+    elif have termux-clipboard-set; then
+        METHOD_USED="termux-clipboard-set"
+        termux-clipboard-set < "$tmp"
 
-    local out=/dev/tty
-    [ -w "$out" ] || out=/dev/stdout
+    elif is_winposix && [ -c /dev/clipboard ]; then
+        METHOD_USED="/dev/clipboard"
+        cat "$tmp" > /dev/clipboard
 
-    # "pc" = set both PRIMARY (Shift+Insert) and CLIPBOARD (Ctrl+V)
-    if [ -n "$TMUX" ]; then
-        printf '\033Ptmux;\033\033]52;pc;%s\a\033\\' "$encoded" > "$out"
-    elif [[ "$TERM" == screen* ]]; then
-        printf '\033P\033]52;pc;%s\a\033\\' "$encoded" > "$out"
+    elif is_wsl && have win32yank.exe; then
+        METHOD_USED="win32yank.exe"
+        win32yank.exe -i < "$tmp"
+
+    elif have clip.exe && { is_wsl || is_winposix; }; then
+        METHOD_USED="clip.exe"
+        if have iconv; then
+            # UTF-16LE + BOM so non-ASCII text survives clip.exe
+            { printf '\377\376'; iconv -f UTF-8 -t UTF-16LE "$tmp"; } | clip.exe
+        else
+            clip.exe < "$tmp"
+        fi
+
+    elif [ -n "${WAYLAND_DISPLAY:-}" ] && have wl-copy; then
+        METHOD_USED="wl-copy"
+        wl-copy < "$tmp" >/dev/null 2>&1 && { wl-copy --primary < "$tmp" >/dev/null 2>&1 || true; }
+
+    elif [ -n "${DISPLAY:-}" ] && have xclip; then
+        METHOD_USED="xclip"
+        xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1 \
+            && { xclip -selection primary -in < "$tmp" >/dev/null 2>&1 || true; }
+
+    elif [ -n "${DISPLAY:-}" ] && have xsel; then
+        METHOD_USED="xsel"
+        xsel --clipboard --input < "$tmp" >/dev/null 2>&1 \
+            && { xsel --primary --input < "$tmp" >/dev/null 2>&1 || true; }
+
     else
-        printf '\033]52;pc;%s\a' "$encoded" > "$out"
+        return 1
     fi
 }
 
-ok() { echo "Contents of $label copied to clipboard ($(wc -c < "$tmp" | tr -d ' ') bytes)"; }
+# ---------- Method: OSC52 (terminal escape sequence, works over SSH) ----------
+copy_osc52() {
+    can_tty || return 1
 
-if [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
-    if copy_via_osc52; then
-        echo "Contents of $label sent to local clipboard via OSC52"
-        echo "(Make sure your terminal supports OSC52 clipboard integration)"
+    local encoded
+    if have base64; then
+        encoded=$(base64 < "$tmp" | tr -d '\n\r')
+    elif have openssl; then
+        encoded=$(openssl base64 -A < "$tmp")
     else
-        exit 1
+        return 1
     fi
-elif command -v pbcopy >/dev/null 2>&1; then
-    pbcopy < "$tmp" && ok
-elif [ -n "$WAYLAND_DISPLAY" ] && command -v wl-copy >/dev/null 2>&1; then
-    wl-copy < "$tmp" && wl-copy --primary < "$tmp" && ok
-elif [ -n "$DISPLAY" ] && command -v xclip >/dev/null 2>&1; then
-    # Set both selections; each xclip forks to hold its selection
-    xclip -selection clipboard -in < "$tmp" >/dev/null 2>&1 \
-        && xclip -selection primary -in < "$tmp" >/dev/null 2>&1 && ok
-elif [ -n "$DISPLAY" ] && command -v xsel >/dev/null 2>&1; then
-    xsel --clipboard --input < "$tmp" >/dev/null 2>&1 \
-        && xsel --primary --input < "$tmp" >/dev/null 2>&1 && ok
-elif command -v clip.exe >/dev/null 2>&1; then
-    clip.exe < "$tmp" && ok
-else
-    echo "No clipboard utility available. Contents of $label:"
-    echo "=========================================="
-    cat "$tmp"
-    echo "=========================================="
-fi
+
+    if [ "${#encoded}" -gt "$OSC52_MAX" ] && [ -z "${COPYCAT_FORCE:-}" ]; then
+        msg "Warning: payload is ${#encoded} bytes (base64), over the OSC52 limit of $OSC52_MAX."
+        msg "Most terminals silently drop this. Use COPYCAT_FORCE=1 to try anyway."
+        return 1
+    fi
+
+    # tmux: also load tmux's own buffer (-w pushes to system clipboard on tmux >= 3.2)
+    if [ -n "${TMUX:-}" ] && have tmux; then
+        tmux load-buffer -w "$tmp" 2>/dev/null || tmux load-buffer "$tmp" 2>/dev/null
+    fi
+
+    # "pc" sets both PRIMARY and CLIPBOARD
+    if [ -n "${TMUX:-}" ]; then
+        printf '\033Ptmux;\033\033]52;pc;%s\a\033\\' "$encoded" > /dev/tty
+    elif [[ "${TERM:-}" == screen* ]]; then
+        printf '\033P\033]52;pc;%s\a\033\\' "$encoded" > /dev/tty
+    else
+        printf '\033]52;pc;%s\a' "$encoded" > /dev/tty
+    fi
+    METHOD_USED="OSC52"
+}
+
+# ---------- Method: save to a file (last resort) ----------
+copy_file() {
+    local dir="${XDG_CACHE_HOME:-$HOME/.cache}/copycat"
+    mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
+    cp "$tmp" "$dir/last" || return 1
+    METHOD_USED="file"
+    msg "No clipboard method available. Saved to: $dir/last"
+    msg "Fetch it with: scp $(whoami)@$(hostname):$dir/last ."
+}
+
+# ---------- Pick the order ----------
+case "$METHOD" in
+    native) order="native" ;;
+    osc52)  order="osc52" ;;
+    file)   order="file" ;;
+    *)
+        if is_ssh; then
+            # Remote: local clipboard is reachable via OSC52; forwarded X11 is a backup
+            order="osc52 native file"
+        else
+            order="native osc52 file"
+        fi
+        ;;
+esac
+
+for m in $order; do
+    if "copy_$m"; then
+        case "$METHOD_USED" in
+            OSC52) msg "Copied $label ($bytes bytes) via OSC52 to your terminal's clipboard"
+                   msg "(If nothing pastes, your terminal may not allow OSC52 clipboard writes)" ;;
+            file)  ;;
+            *)     msg "Copied $label ($bytes bytes) to clipboard via $METHOD_USED" ;;
+        esac
+        exit 0
+    fi
+done
+
+echo "Error: could not copy to clipboard" >&2
+exit 1
