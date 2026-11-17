@@ -13,4 +13,4 @@ A collection of useful shell scripts for system administration, automation, and 
 
 ---
 
-Add new scripts to the table as they are created.
+Nothing new under the sun. 
