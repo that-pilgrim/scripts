@@ -10,7 +10,7 @@ A collection of useful shell scripts for system administration, automation, and 
 | `copycat.sh` | Copies the contents of a file to the clipboard (if possible) |
 | `rsync.sh` | Assistant to set up an RSYNC environment between two servers and builds the transfer command |
 | `treecat.sh` | Should have posted this one when I first created it lol, it cats all files in a directory tree |
-| `tld.sh` | A WHOIS like lookup for uncommon TLDs |
+| `tld.sh` | A WHOIS like lookup for uncommon TLDs and DNS records |
 
 ---
 
